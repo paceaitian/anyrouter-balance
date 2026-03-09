@@ -635,7 +635,7 @@ async function doLogin() {
   if (res.ok) {
     document.getElementById('loginPage').style.display = 'none';
     document.getElementById('mainPage').style.display = 'block';
-    loadAccounts();
+    loadAccounts().then(function() { refreshAll(); });
   } else {
     showMsg('loginMsg', '密码错误', true);
   }
@@ -808,7 +808,7 @@ F(API + '/admin/api/accounts').then(function(r) {
   if (r.ok) {
     document.getElementById('loginPage').style.display = 'none';
     document.getElementById('mainPage').style.display = 'block';
-    loadAccounts();
+    loadAccounts().then(function() { refreshAll(); });
   }
 });
 </script>
