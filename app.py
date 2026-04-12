@@ -2,6 +2,7 @@
 # 纯 HTTP + WAF 计算绕过，无需 Playwright/Chromium
 # 基于 ishadows (linux.do) 的 acw_sc__v2 纯计算方案
 
+import asyncio
 import json
 import logging
 import os
@@ -23,6 +24,9 @@ app = FastAPI(title="AnyRouter Balance API")
 DB_PATH = os.getenv("DB_PATH", "/app/data/checkin.db")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 UPSTREAM = os.getenv("UPSTREAM", "https://anyrouter.top")
+RELAY_URL = os.getenv("RELAY_URL", "")
+FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
+HEALTH_INTERVAL = int(os.getenv("HEALTH_INTERVAL", "3600"))
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -220,13 +224,27 @@ def _init_db():
     conn.close()
 
 
+def _migrate_db():
+    """数据库迁移：添加新字段"""
+    conn = sqlite3.connect(DB_PATH)
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()]
+    if "api_key" not in columns:
+        conn.execute("ALTER TABLE accounts ADD COLUMN api_key TEXT NOT NULL DEFAULT ''")
+    if "last_health" not in columns:
+        conn.execute("ALTER TABLE accounts ADD COLUMN last_health TEXT")
+    if "health_status" not in columns:
+        conn.execute("ALTER TABLE accounts ADD COLUMN health_status TEXT")
+    conn.commit()
+    conn.close()
+
+
 def _get_accounts(include_disabled: bool = False) -> list[dict]:
     """从 SQLite 读取账号"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     where = "" if include_disabled else "WHERE enabled=1"
     rows = conn.execute(
-        f"SELECT id, name, api_user, cookies, enabled, last_balance, last_used, last_checkin, last_status FROM accounts {where}"
+        f"SELECT id, name, api_user, api_key, cookies, enabled, last_balance, last_used, last_checkin, last_status, last_health, health_status FROM accounts {where}"
     ).fetchall()
     conn.close()
     result = []
@@ -236,6 +254,7 @@ def _get_accounts(include_disabled: bool = False) -> list[dict]:
             "id": row["id"],
             "name": row["name"],
             "api_user": row["api_user"],
+            "api_key": row["api_key"] if "api_key" in row.keys() else "",
             "session": cookies.get("session", ""),
             "has_session": bool(cookies.get("session")),
             "enabled": bool(row["enabled"]),
@@ -243,18 +262,20 @@ def _get_accounts(include_disabled: bool = False) -> list[dict]:
             "cached_used": row["last_used"],
             "last_checkin": row["last_checkin"],
             "last_status": row["last_status"],
+            "last_health": row["last_health"] if "last_health" in row.keys() else None,
+            "health_status": row["health_status"] if "health_status" in row.keys() else None,
         })
     return result
 
 
-def _add_account(name: str, api_user: str, session_val: str) -> bool:
+def _add_account(name: str, api_user: str, session_val: str, api_key: str = "") -> bool:
     """新增账号"""
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute(
-            "INSERT INTO accounts (name, provider, auth_method, cookies, api_user, enabled, created_at, updated_at) "
-            "VALUES (?, 'anyrouter', 'cookie', ?, ?, 1, datetime('now'), datetime('now'))",
-            (name, json.dumps({"session": session_val}), api_user),
+            "INSERT INTO accounts (name, provider, auth_method, cookies, api_user, api_key, enabled, created_at, updated_at) "
+            "VALUES (?, 'anyrouter', 'cookie', ?, ?, ?, 1, datetime('now'), datetime('now'))",
+            (name, json.dumps({"session": session_val}), api_user, api_key),
         )
         conn.commit()
         return True
@@ -274,7 +295,7 @@ def _delete_account(name: str) -> bool:
     return deleted
 
 
-def _update_account(name: str, api_user: Optional[str] = None, session_val: Optional[str] = None, enabled: Optional[bool] = None):
+def _update_account(name: str, api_user: Optional[str] = None, session_val: Optional[str] = None, api_key: Optional[str] = None, enabled: Optional[bool] = None):
     """更新账号信息"""
     conn = sqlite3.connect(DB_PATH)
     if api_user is not None:
@@ -284,6 +305,8 @@ def _update_account(name: str, api_user: Optional[str] = None, session_val: Opti
         cookies = json.loads(row[0]) if row and row[0] else {}
         cookies["session"] = session_val
         conn.execute("UPDATE accounts SET cookies=?, updated_at=datetime('now') WHERE name=?", (json.dumps(cookies), name))
+    if api_key is not None:
+        conn.execute("UPDATE accounts SET api_key=?, updated_at=datetime('now') WHERE name=?", (api_key, name))
     if enabled is not None:
         conn.execute("UPDATE accounts SET enabled=?, updated_at=datetime('now') WHERE name=?", (1 if enabled else 0, name))
     conn.commit()
@@ -442,9 +465,10 @@ async def admin_add_account(request: Request, admin_token: Optional[str] = Cooki
     name = data.get("name", "").strip()
     api_user = data.get("api_user", "").strip()
     session_val = data.get("session", "").strip()
+    api_key = data.get("api_key", "").strip()
     if not name or not api_user or not session_val:
         raise HTTPException(status_code=400, detail="name, api_user, session 均为必填")
-    if not _add_account(name, api_user, session_val):
+    if not _add_account(name, api_user, session_val, api_key):
         raise HTTPException(status_code=409, detail="账号已存在")
     return {"success": True}
 
@@ -459,6 +483,7 @@ async def admin_update_account(name: str, request: Request, admin_token: Optiona
         name,
         api_user=data.get("api_user"),
         session_val=data.get("session"),
+        api_key=data.get("api_key"),
         enabled=data.get("enabled"),
     )
     return {"success": True}
@@ -496,6 +521,141 @@ async def admin_refresh_all(admin_token: Optional[str] = Cookie(None)):
     for acc in accounts:
         if acc["session"]:
             results.append(await query_balance(acc))
+    return {"results": results}
+
+
+# ======== 测活 + 飞书通知 ========
+
+
+async def health_check_account(name: str, api_key: str) -> dict:
+    """模拟 Claude Code 请求测活"""
+    if not RELAY_URL:
+        return {"name": name, "success": False, "error": "未配置 RELAY_URL"}
+    if not api_key:
+        return {"name": name, "success": False, "error": "未配置 API Key"}
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                f"{RELAY_URL}/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-opus-4-6",
+                    "max_tokens": 50,
+                    "messages": [{"role": "user", "content": "show me the money"}],
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                text = ""
+                for block in data.get("content", []):
+                    if block.get("type") == "text":
+                        text = block.get("text", "")[:100]
+                        break
+                return {"name": name, "success": True, "response": text}
+            else:
+                return {"name": name, "success": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+    except Exception as e:
+        return {"name": name, "success": False, "error": str(e)}
+
+
+def _update_health_status(name: str, success: bool, error: str = ""):
+    """更新测活状态"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        status = "alive" if success else f"dead:{error}"
+        conn.execute(
+            "UPDATE accounts SET health_status=?, last_health=datetime('now','localtime'), updated_at=datetime('now') WHERE name=?",
+            (status, name),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"更新测活状态失败 {name}: {e}")
+
+
+async def send_feishu_notification(results: list):
+    """发送飞书 Webhook 通知"""
+    if not FEISHU_WEBHOOK or not results:
+        return
+
+    alive = [r for r in results if r["success"]]
+    dead = [r for r in results if not r["success"]]
+
+    if not alive:
+        return
+
+    lines = [f"**✅ 存活账号 ({len(alive)})**\n"]
+    for r in alive:
+        lines.append(f"- **{r['name']}**: 正常")
+    if dead:
+        lines.append(f"\n**❌ 失效账号 ({len(dead)})**")
+        for r in dead:
+            lines.append(f"- **{r['name']}**: {r.get('error', '未知错误')}")
+
+    card = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {"content": "🔍 账号测活报告", "tag": "plain_text"},
+                "template": "green" if not dead else "orange",
+            },
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}},
+                {"tag": "div", "text": {"tag": "plain_text", "content": f"检查时间: {time.strftime('%Y-%m-%d %H:%M:%S')}"}},
+            ],
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(FEISHU_WEBHOOK, json=card)
+    except Exception as e:
+        logger.error(f"飞书通知发送失败: {e}")
+
+
+async def run_health_check_all() -> list:
+    """执行所有账号测活"""
+    accounts = _get_accounts()
+    targets = [a for a in accounts if a["api_key"]]
+    if not targets:
+        logger.info("无配置 api_key 的账号，跳过测活")
+        return []
+
+    results = []
+    for acc in targets:
+        result = await health_check_account(acc["name"], acc["api_key"])
+        results.append(result)
+        _update_health_status(acc["name"], result["success"], result.get("error", ""))
+
+    alive_count = sum(1 for r in results if r["success"])
+    logger.info(f"测活完成: {alive_count}/{len(results)} 存活")
+
+    await send_feishu_notification(results)
+    return results
+
+
+async def _health_check_loop():
+    """后台测活循环"""
+    await asyncio.sleep(60)  # 启动后等待 60 秒再开始第一次
+    while True:
+        try:
+            await run_health_check_all()
+        except Exception as e:
+            logger.error(f"测活循环异常: {e}")
+        await asyncio.sleep(HEALTH_INTERVAL)
+
+
+@app.post("/admin/api/health-check")
+async def admin_health_check(admin_token: Optional[str] = Cookie(None)):
+    """手动触发测活"""
+    if not _check_session(admin_token):
+        raise HTTPException(status_code=401, detail="未登录")
+    results = await run_health_check_all()
     return {"results": results}
 
 
@@ -573,6 +733,7 @@ tr:hover td{background:#262f3f}
       <h1>AnyRouter Balance</h1>
       <div style="display:flex;gap:.5rem;flex-wrap:wrap">
         <button class="btn btn-success" onclick="refreshAll()">刷新全部余额</button>
+        <button class="btn btn-success" onclick="healthCheckAll()" style="background:#8b5cf6">测活全部</button>
         <button class="btn btn-primary" onclick="showAddModal()">添加账号</button>
         <button class="btn btn-ghost" onclick="doLogout()">退出</button>
       </div>
@@ -584,7 +745,7 @@ tr:hover td{background:#262f3f}
       <div class="stat-card"><div class="label">账号数</div><div id="totalCount" class="value count">--</div></div>
     </div>
     <table>
-      <thead><tr><th>账号</th><th>余额</th><th>已用</th><th>状态</th><th>最后更新</th><th>操作</th></tr></thead>
+      <thead><tr><th>账号</th><th>余额</th><th>已用</th><th>余额状态</th><th>测活状态</th><th>最后更新</th><th>操作</th></tr></thead>
       <tbody id="accountsBody"><tr><td colspan="6" style="text-align:center;color:#64748b">加载中...</td></tr></tbody>
     </table>
     <div style="margin-top:1.5rem;padding:1rem;background:#1e293b;border-radius:10px;font-size:.85rem;color:#94a3b8;line-height:1.8">
@@ -607,6 +768,8 @@ tr:hover td{background:#262f3f}
     <input id="mApiUser" placeholder="登录后访问 /api/user/self 获取 data.id">
     <label>Session Cookie</label>
     <textarea id="mSession" placeholder="浏览器 F12 → Cookies → session 的值"></textarea>
+    <label>API Key（测活用，sk-xxx）</label>
+    <input id="mApiKey" placeholder="留空则不参与测活">
     <div style="margin-top:1rem;padding:.8rem;background:#0f172a;border-radius:6px;font-size:.8rem;color:#94a3b8;line-height:1.6">
       <div style="color:#60a5fa;font-weight:600;margin-bottom:.4rem">CC Switch 配置说明</div>
       <div>1. 模板选择 <b style="color:#e2e8f0">NewAPI</b></div>
@@ -662,7 +825,7 @@ async function loadAccounts() {
   let totalBal = 0, totalUsed = 0;
 
   if (accounts.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#64748b">暂无账号，点击"添加账号"开始</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#64748b">暂无账号，点击"添加账号"开始</td></tr>';
   } else {
     tbody.innerHTML = accounts.map(function(a) {
       const bal = a.cached_balance != null ? a.cached_balance : 0;
@@ -676,16 +839,26 @@ async function loadAccounts() {
         : a.last_status === 'success'
         ? '<span class="badge badge-ok">正常</span>'
         : '<span class="badge badge-err">' + (a.last_status || '未知') + '</span>';
+      var hs = a.health_status || '';
+      var healthBadge = !a.api_key
+        ? '<span class="badge badge-off">未配置Key</span>'
+        : hs.startsWith('alive')
+        ? '<span class="badge badge-ok">存活</span>'
+        : hs.startsWith('dead')
+        ? '<span class="badge badge-err">失效</span>'
+        : '<span class="badge badge-off">未检测</span>';
+      var healthTime = a.last_health ? a.last_health.replace('T',' ').substring(5,16) : '-';
       const lastTime = a.last_checkin ? a.last_checkin.replace('T',' ').substring(5,16) : '-';
       return '<tr>'
         + '<td><b>' + esc(a.name) + '</b><br><small style="color:#64748b">ID: ' + esc(a.api_user) + '</small></td>'
         + '<td style="color:#34d399;font-weight:600">$' + bal.toFixed(2) + '</td>'
         + '<td style="color:#fb923c">$' + used.toFixed(2) + '</td>'
         + '<td>' + statusBadge + '</td>'
+        + '<td>' + healthBadge + '<br><small style="color:#64748b;font-size:.7rem">' + healthTime + '</small></td>'
         + '<td style="color:#94a3b8;font-size:.8rem">' + lastTime + '</td>'
         + '<td><div class="actions">'
         + '<button class="btn btn-primary btn-sm" data-action="refresh" data-name="' + esc(a.name) + '">刷新</button>'
-        + '<button class="btn btn-ghost btn-sm" data-action="edit" data-name="' + esc(a.name) + '" data-apiuser="' + esc(a.api_user) + '" data-enabled="' + a.enabled + '">编辑</button>'
+        + '<button class="btn btn-ghost btn-sm" data-action="edit" data-name="' + esc(a.name) + '" data-apiuser="' + esc(a.api_user) + '" data-apikey="' + esc(a.api_key || '') + '" data-enabled="' + a.enabled + '">编辑</button>'
         + '<button class="btn btn-danger btn-sm" data-action="delete" data-name="' + esc(a.name) + '">删除</button>'
         + '</div></td></tr>';
     }).join('');
@@ -703,7 +876,7 @@ document.getElementById('accountsBody').addEventListener('click', function(e) {
   const action = btn.dataset.action;
   const name = btn.dataset.name;
   if (action === 'refresh') refreshOne(name, btn);
-  else if (action === 'edit') editAccount(name, btn.dataset.apiuser, btn.dataset.enabled === 'true');
+  else if (action === 'edit') editAccount(name, btn.dataset.apiuser, btn.dataset.enabled === 'true', btn.dataset.apikey || '');
   else if (action === 'delete') deleteAccount(name);
 });
 
@@ -742,12 +915,13 @@ function showAddModal() {
   document.getElementById('mApiUser').value = '';
   document.getElementById('mSession').value = '';
   document.getElementById('mSession').placeholder = '浏览器 F12 → Cookies → session 的值';
+  document.getElementById('mApiKey').value = '';
   document.getElementById('ccBaseUrl').textContent = location.origin;
   document.getElementById('modalMsg').className = 'msg';
   document.getElementById('modalOverlay').classList.add('active');
 }
 
-function editAccount(name, apiUser, enabled) {
+function editAccount(name, apiUser, enabled, apiKey) {
   editingName = name;
   document.getElementById('modalTitle').textContent = '编辑 ' + name;
   document.getElementById('modalSubmit').textContent = '保存';
@@ -756,6 +930,7 @@ function editAccount(name, apiUser, enabled) {
   document.getElementById('mApiUser').value = apiUser;
   document.getElementById('mSession').value = '';
   document.getElementById('mSession').placeholder = '留空不修改 session';
+  document.getElementById('mApiKey').value = apiKey || '';
   document.getElementById('ccBaseUrl').textContent = location.origin;
   document.getElementById('modalMsg').className = 'msg';
   document.getElementById('modalOverlay').classList.add('active');
@@ -769,9 +944,10 @@ async function submitAccount() {
   const name = document.getElementById('mName').value.trim();
   const apiUser = document.getElementById('mApiUser').value.trim();
   const session = document.getElementById('mSession').value.trim();
+  const apiKey = document.getElementById('mApiKey').value.trim();
 
   if (editingName) {
-    const body = {api_user: apiUser};
+    const body = {api_user: apiUser, api_key: apiKey};
     if (session) body.session = session;
     const res = await F(API + '/admin/api/accounts/' + encodeURIComponent(editingName), {
       method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
@@ -782,7 +958,7 @@ async function submitAccount() {
     if (!name || !apiUser || !session) { showMsg('modalMsg', '所有字段均为必填', true); return; }
     const res = await F(API + '/admin/api/accounts', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name: name, api_user: apiUser, session: session})
+      body: JSON.stringify({name: name, api_user: apiUser, session: session, api_key: apiKey})
     });
     if (res.ok) { closeModal(); await loadAccounts(); showMsg('globalMsg', name + ' 已添加', false); }
     else { const d = await res.json(); showMsg('modalMsg', d.detail || '添加失败', true); }
@@ -793,6 +969,16 @@ async function deleteAccount(name) {
   if (!confirm('确定删除 ' + name + '？')) return;
   const res = await F(API + '/admin/api/accounts/' + encodeURIComponent(name), {method: 'DELETE'});
   if (res.ok) { await loadAccounts(); showMsg('globalMsg', name + ' 已删除', false); }
+}
+
+async function healthCheckAll() {
+  showMsg('globalMsg', '正在测活...', false);
+  const res = await F(API + '/admin/api/health-check', {method: 'POST'});
+  const data = await res.json();
+  const results = data.results || [];
+  const alive = results.filter(function(r){return r.success}).length;
+  showMsg('globalMsg', '测活完成: ' + alive + '/' + results.length + ' 存活', alive < results.length);
+  await loadAccounts();
 }
 
 function showMsg(id, text, isErr) {
@@ -825,6 +1011,9 @@ async def dashboard():
 @app.on_event("startup")
 async def startup():
     _init_db()
+    _migrate_db()
+    if RELAY_URL:
+        asyncio.create_task(_health_check_loop())
 
 
 if __name__ == "__main__":
