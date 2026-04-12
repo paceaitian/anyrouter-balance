@@ -9,7 +9,7 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - ADMIN_PASSWORD=your_password_here
-      - RELAY_URL=https://api.ccui.cc
+      - RELAY_URL=https://anyrouter.top
       - FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/c72a4993-bfa6-4780-8a13-b5acd051f1a8
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/')"]

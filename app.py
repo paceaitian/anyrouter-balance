@@ -528,19 +528,29 @@ async def admin_refresh_all(admin_token: Optional[str] = Cookie(None)):
 
 
 async def health_check_account(name: str, api_key: str) -> dict:
-    """模拟 Claude Code 请求测活"""
+    """测活：先验证 API Key 有效性，再尝试发送 Claude 请求"""
     if not RELAY_URL:
         return {"name": name, "success": False, "error": "未配置 RELAY_URL"}
     if not api_key:
         return {"name": name, "success": False, "error": "未配置 API Key"}
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
+        async with httpx.AsyncClient(timeout=30) as client:
+            # 第一步：验证 API Key 有效（GET /v1/models）
+            resp = await client.get(
+                f"{RELAY_URL}/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if resp.status_code == 401:
+                return {"name": name, "success": False, "error": "API Key 无效或已过期"}
+            if resp.status_code != 200:
+                return {"name": name, "success": False, "error": f"Key 验证失败: HTTP {resp.status_code}"}
+
+            # 第二步：尝试实际发送消息
+            msg_resp = await client.post(
                 f"{RELAY_URL}/v1/messages",
                 headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
+                    "Authorization": f"Bearer {api_key}",
                     "content-type": "application/json",
                 },
                 json={
@@ -549,16 +559,18 @@ async def health_check_account(name: str, api_key: str) -> dict:
                     "messages": [{"role": "user", "content": "show me the money"}],
                 },
             )
-            if resp.status_code == 200:
-                data = resp.json()
+            if msg_resp.status_code == 200:
+                data = msg_resp.json()
                 text = ""
                 for block in data.get("content", []):
                     if block.get("type") == "text":
                         text = block.get("text", "")[:100]
                         break
-                return {"name": name, "success": True, "response": text}
+                return {"name": name, "success": True, "detail": f"消息成功: {text}"}
             else:
-                return {"name": name, "success": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+                # Key 有效但消息受限（如需启用 1M），仍算存活
+                body = msg_resp.text[:200]
+                return {"name": name, "success": True, "detail": f"Key 有效, 消息受限: {body}"}
     except Exception as e:
         return {"name": name, "success": False, "error": str(e)}
 
