@@ -859,7 +859,7 @@ async function loadAccounts() {
         + '<td style="color:#34d399;font-weight:600">$' + bal.toFixed(2) + '</td>'
         + '<td style="color:#fb923c">$' + used.toFixed(2) + '</td>'
         + '<td>' + statusBadge + '</td>'
-        + '<td>' + healthBadge + '<br><small style="color:#94a3b8;font-size:.7rem" title="' + esc(healthDetail) + '">' + esc(healthDetail.length > 30 ? healthDetail.substring(0,30) + '...' : healthDetail) + '</small><br><small style="color:#64748b;font-size:.65rem">' + healthTime + '</small></td>'
+        + '<td>' + healthBadge + '<br><small style="color:#94a3b8;font-size:.7rem;cursor:pointer;text-decoration:underline dotted" onclick="alert(this.dataset.detail)" data-detail="' + esc(healthDetail).replace(/"/g,'&quot;') + '">' + esc(healthDetail.length > 40 ? healthDetail.substring(0,40) + '...' : healthDetail) + '</small><br><small style="color:#64748b;font-size:.65rem">' + healthTime + '</small></td>'
         + '<td style="color:#94a3b8;font-size:.8rem">' + lastTime + '</td>'
         + '<td><div class="actions">'
         + '<button class="btn btn-primary btn-sm" data-action="refresh" data-name="' + esc(a.name) + '">刷新</button>'
