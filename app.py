@@ -535,7 +535,7 @@ async def health_check_account(name: str, api_key: str) -> dict:
         return {"name": name, "success": False, "error": "未配置 API Key"}
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 f"{RELAY_URL}/v1/messages",
                 headers={
