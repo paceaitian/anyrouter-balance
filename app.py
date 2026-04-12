@@ -568,11 +568,11 @@ async def health_check_account(name: str, api_key: str) -> dict:
         return {"name": name, "success": False, "error": str(e)}
 
 
-def _update_health_status(name: str, success: bool, error: str = ""):
-    """更新测活状态"""
+def _update_health_status(name: str, success: bool, detail: str = ""):
+    """更新测活状态和响应内容"""
     try:
         conn = sqlite3.connect(DB_PATH)
-        status = "alive" if success else f"dead:{error}"
+        status = f"alive:{detail[:200]}" if success else f"dead:{detail[:200]}"
         conn.execute(
             "UPDATE accounts SET health_status=?, last_health=datetime('now','localtime'), updated_at=datetime('now') WHERE name=?",
             (status, name),
@@ -596,11 +596,8 @@ async def send_feishu_notification(results: list):
 
     lines = [f"**✅ 存活账号 ({len(alive)})**\n"]
     for r in alive:
-        lines.append(f"- **{r['name']}**: 正常")
-    if dead:
-        lines.append(f"\n**❌ 失效账号 ({len(dead)})**")
-        for r in dead:
-            lines.append(f"- **{r['name']}**: {r.get('error', '未知错误')}")
+        detail = r.get('detail', '正常')[:80]
+        lines.append(f"- **{r['name']}**: {detail}")
 
     card = {
         "msg_type": "interactive",
@@ -635,7 +632,7 @@ async def run_health_check_all() -> list:
     for acc in targets:
         result = await health_check_account(acc["name"], acc["api_key"])
         results.append(result)
-        _update_health_status(acc["name"], result["success"], result.get("error", ""))
+        _update_health_status(acc["name"], result["success"], result.get("detail") or result.get("error", ""))
 
     alive_count = sum(1 for r in results if r["success"])
     logger.info(f"测活完成: {alive_count}/{len(results)} 存活")
@@ -852,6 +849,9 @@ async function loadAccounts() {
         : hs.startsWith('dead')
         ? '<span class="badge badge-err">失效</span>'
         : '<span class="badge badge-off">未检测</span>';
+      var healthDetail = '';
+      if (hs.indexOf(':') > 0) healthDetail = hs.substring(hs.indexOf(':') + 1);
+      if (healthDetail.length > 60) healthDetail = healthDetail.substring(0, 60) + '...';
       var healthTime = a.last_health ? a.last_health.replace('T',' ').substring(5,16) : '-';
       const lastTime = a.last_checkin ? a.last_checkin.replace('T',' ').substring(5,16) : '-';
       return '<tr>'
@@ -859,7 +859,7 @@ async function loadAccounts() {
         + '<td style="color:#34d399;font-weight:600">$' + bal.toFixed(2) + '</td>'
         + '<td style="color:#fb923c">$' + used.toFixed(2) + '</td>'
         + '<td>' + statusBadge + '</td>'
-        + '<td>' + healthBadge + '<br><small style="color:#64748b;font-size:.7rem">' + healthTime + '</small></td>'
+        + '<td>' + healthBadge + '<br><small style="color:#94a3b8;font-size:.7rem" title="' + esc(healthDetail) + '">' + esc(healthDetail.length > 30 ? healthDetail.substring(0,30) + '...' : healthDetail) + '</small><br><small style="color:#64748b;font-size:.65rem">' + healthTime + '</small></td>'
         + '<td style="color:#94a3b8;font-size:.8rem">' + lastTime + '</td>'
         + '<td><div class="actions">'
         + '<button class="btn btn-primary btn-sm" data-action="refresh" data-name="' + esc(a.name) + '">刷新</button>'
