@@ -546,11 +546,12 @@ async def health_check_account(name: str, api_key: str) -> dict:
             if resp.status_code != 200:
                 return {"name": name, "success": False, "error": f"Key 验证失败: HTTP {resp.status_code}"}
 
-            # 第二步：尝试实际发送消息
+            # 第二步：尝试实际发送消息（带 1M 上下文 beta header）
             msg_resp = await client.post(
                 f"{RELAY_URL}/v1/messages",
                 headers={
                     "Authorization": f"Bearer {api_key}",
+                    "anthropic-beta": "context-1m-2025-08-07",
                     "content-type": "application/json",
                 },
                 json={
