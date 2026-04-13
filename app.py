@@ -691,7 +691,7 @@ header h1{font-size:1.4rem;color:#60a5fa}
 .btn-success{background:#10b981;color:#fff}.btn-success:hover{background:#059669}
 .btn-ghost{background:transparent;color:#94a3b8;border:1px solid #334155}.btn-ghost:hover{background:#1e293b}
 .btn-sm{padding:.3rem .6rem;font-size:.8rem}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-bottom:1.5rem}
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:1rem;margin-bottom:1.5rem}
 .stat-card{background:#1e293b;border-radius:10px;padding:1.2rem;text-align:center}
 .stat-card .label{font-size:.8rem;color:#94a3b8;margin-bottom:.3rem}
 .stat-card .value{font-size:1.6rem;font-weight:700;color:#34d399}
@@ -981,7 +981,7 @@ async function deleteAccount(name) {
 }
 
 async function healthCheckAll() {
-  showMsg('globalMsg', '正在测活...', false);
+  showMsg('globalMsg', '正在测活（可能需要几分钟）...', false, 600000);
   const res = await F(API + '/admin/api/health-check', {method: 'POST'});
   const data = await res.json();
   const results = data.results || [];
@@ -990,11 +990,15 @@ async function healthCheckAll() {
   await loadAccounts();
 }
 
-function showMsg(id, text, isErr) {
+var _msgTimers = {};
+function showMsg(id, text, isErr, keepMs) {
   var el = document.getElementById(id);
   el.textContent = text;
   el.className = 'msg ' + (isErr ? 'err' : 'ok');
-  if (id !== 'modalMsg') setTimeout(function() { el.className = 'msg'; }, 5000);
+  if (id !== 'modalMsg') {
+    if (_msgTimers[id]) clearTimeout(_msgTimers[id]);
+    _msgTimers[id] = setTimeout(function() { el.className = 'msg'; }, keepMs || 5000);
+  }
 }
 
 function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
