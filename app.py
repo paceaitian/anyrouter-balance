@@ -528,44 +528,48 @@ async def admin_refresh_all(admin_token: Optional[str] = Cookie(None)):
 
 
 async def health_check_account(name: str, api_key: str) -> dict:
-    """测活：发送完整 Claude API 请求，只有 200 + 正确响应才算存活"""
+    """测活：发送完整 Claude API 请求，失败最多重试 5 次"""
     if not RELAY_URL:
         return {"name": name, "success": False, "error": "未配置 RELAY_URL"}
     if not api_key:
         return {"name": name, "success": False, "error": "未配置 API Key"}
 
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                f"{RELAY_URL}/v1/messages",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "anthropic-beta": "context-1m-2025-08-07",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-opus-4-6",
-                    "max_tokens": 50,
-                    "messages": [{"role": "user", "content": "show me the money"}],
-                },
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                text = ""
-                for block in data.get("content", []):
-                    if block.get("type") == "text":
-                        text = block.get("text", "")[:100]
-                        break
-                if text:
-                    return {"name": name, "success": True, "detail": text}
-                return {"name": name, "success": False, "error": "200 但无 text 内容"}
-            elif resp.status_code == 401:
-                return {"name": name, "success": False, "error": "API Key 无效或已过期"}
-            else:
-                body = resp.text[:200]
-                return {"name": name, "success": False, "error": f"HTTP {resp.status_code}: {body}"}
-    except Exception as e:
-        return {"name": name, "success": False, "error": str(e)}
+    last_error = ""
+    for attempt in range(5):
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(
+                    f"{RELAY_URL}/v1/messages",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "anthropic-beta": "context-1m-2025-08-07",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": "claude-opus-4-6",
+                        "max_tokens": 50,
+                        "messages": [{"role": "user", "content": "show me the money"}],
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    text = ""
+                    for block in data.get("content", []):
+                        if block.get("type") == "text":
+                            text = block.get("text", "")[:100]
+                            break
+                    if text:
+                        return {"name": name, "success": True, "detail": text}
+                    last_error = "200 但无 text 内容"
+                elif resp.status_code == 401:
+                    return {"name": name, "success": False, "error": "API Key 无效或已过期"}
+                else:
+                    last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
+        except Exception as e:
+            last_error = str(e)
+        if attempt < 4:
+            await asyncio.sleep(10)
+    return {"name": name, "success": False, "error": f"5 次重试均失败: {last_error}"}
 
 
 def _update_health_status(name: str, success: bool, detail: str = ""):
