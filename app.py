@@ -10,6 +10,7 @@ import re
 import secrets
 import sqlite3
 import time
+import uuid
 from typing import Optional
 
 import httpx
@@ -527,8 +528,15 @@ async def admin_refresh_all(admin_token: Optional[str] = Cookie(None)):
 # ======== 测活 + 飞书通知 ========
 
 
+def _generate_health_user_id() -> str:
+    """生成符合 AnyRouter 验证格式的 metadata.user_id（JSON 字符串）"""
+    device_id = secrets.token_hex(32)
+    session_id = str(uuid.uuid4())
+    return json.dumps({"device_id": device_id, "account_uuid": "", "session_id": session_id})
+
+
 async def health_check_account(name: str, api_key: str) -> dict:
-    """测活：发送完整 Claude API 请求，失败最多重试 5 次"""
+    """测活：模拟 Claude Code 完整请求，失败最多重试 5 次"""
     if not RELAY_URL:
         return {"name": name, "success": False, "error": "未配置 RELAY_URL"}
     if not api_key:
@@ -542,13 +550,19 @@ async def health_check_account(name: str, api_key: str) -> dict:
                     f"{RELAY_URL}/v1/messages",
                     headers={
                         "Authorization": f"Bearer {api_key}",
-                        "anthropic-beta": "context-1m-2025-08-07",
+                        "anthropic-beta": "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,fast-mode-2026-02-01",
                         "content-type": "application/json",
+                        "anthropic-version": "2023-06-01",
+                        "User-Agent": "claude-cli/2.1.92 (external, cli)",
+                        "x-app": "cli",
                     },
                     json={
-                        "model": "claude-opus-4-6",
+                        "model": "claude-opus-4-7",
                         "max_tokens": 50,
+                        "system": [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}],
                         "messages": [{"role": "user", "content": "show me the money"}],
+                        "metadata": {"user_id": _generate_health_user_id()},
+                        "thinking": {"type": "adaptive"},
                     },
                 )
                 if resp.status_code == 200:
